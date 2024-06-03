@@ -541,6 +541,7 @@ func constructWithCfCodeModel(body []byte) []byte {
 			"content": content,
 		},
 	}
+	body, _ = sjson.SetBytes(body, "prompt", nil)
 	return constructWithChatModel(body, messages)
 }
 
