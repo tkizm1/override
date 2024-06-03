@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -43,6 +44,108 @@ type config struct {
 	ChatModelMap         map[string]string `json:"chat_model_map"`
 	ChatLocale           string            `json:"chat_locale"`
 	AuthToken            string            `json:"auth_token"`
+}
+
+type GPTMessage struct {
+	Role    string `json:"role"`
+	Content string `json:"content"`
+}
+type StreamResponse struct {
+	Response string `json:"response"`
+}
+type Message struct {
+	Role    string  `json:"role,omitempty"`
+	Content any     `json:"content,omitempty"`
+	Name    *string `json:"name,omitempty"`
+}
+type ChatCompletionsStreamResponseChoice struct {
+	Index        int     `json:"index"`
+	Delta        Message `json:"delta"`
+	FinishReason *string `json:"finish_reason,omitempty"`
+}
+
+type ChatCompletionsStreamResponse struct {
+	Id      string                                `json:"id"`
+	Object  string                                `json:"object"`
+	Created int64                                 `json:"created"`
+	Model   string                                `json:"model"`
+	Choices []ChatCompletionsStreamResponseChoice `json:"choices"`
+}
+type CustomEvent struct {
+	Event string
+	Id    string
+	Retry uint
+	Data  interface{}
+}
+type stringWriter interface {
+	io.Writer
+	writeString(string) (int, error)
+}
+
+type stringWrapper struct {
+	io.Writer
+}
+
+var dataReplacer = strings.NewReplacer(
+	"\n", "\ndata:",
+	"\r", "\\r")
+var contentType = []string{"text/event-stream"}
+var noCache = []string{"no-cache"}
+
+func (w stringWrapper) writeString(str string) (int, error) {
+	return w.Writer.Write([]byte(str))
+}
+func checkWriter(writer io.Writer) stringWriter {
+	if w, ok := writer.(stringWriter); ok {
+		return w
+	} else {
+		return stringWrapper{writer}
+	}
+}
+func encode(writer io.Writer, event CustomEvent) error {
+	w := checkWriter(writer)
+	return writeData(w, event.Data)
+}
+func writeData(w stringWriter, data interface{}) error {
+	dataReplacer.WriteString(w, fmt.Sprint(data))
+	if strings.HasPrefix(data.(string), "data") {
+		w.writeString("\n\n")
+	}
+	return nil
+}
+func (r CustomEvent) Render(w http.ResponseWriter) error {
+	r.WriteContentType(w)
+	return encode(w, r)
+}
+
+func (r CustomEvent) WriteContentType(w http.ResponseWriter) {
+	header := w.Header()
+	header["Content-Type"] = contentType
+
+	if _, exist := header["Cache-Control"]; !exist {
+		header["Cache-Control"] = noCache
+	}
+}
+
+func GetTimestamp() int64 {
+	return time.Now().Unix()
+}
+
+func SetEventStreamHeaders(c *gin.Context) {
+	c.Writer.Header().Set("Content-Type", "text/event-stream")
+	c.Writer.Header().Set("Cache-Control", "no-cache")
+	c.Writer.Header().Set("Connection", "keep-alive")
+	c.Writer.Header().Set("Transfer-Encoding", "chunked")
+	c.Writer.Header().Set("X-Accel-Buffering", "no")
+}
+
+const (
+	RequestIdKey = "X-Oneapi-Request-Id"
+)
+
+func GetResponseID(c *gin.Context) string {
+	logID := c.GetString(RequestIdKey)
+	return fmt.Sprintf("chatcmpl-%s", logID)
 }
 
 func readConfig() *config {
@@ -330,7 +433,91 @@ func (s *ProxyService) codeCompletions(c *gin.Context) {
 		c.Header("Content-Type", contentType)
 	}
 
-	_, _ = io.Copy(c.Writer, resp.Body)
+	//_, _ = io.Copy(c.Writer, resp.Body)
+	scanner := bufio.NewScanner(resp.Body)
+	scanner.Split(func(data []byte, atEOF bool) (advance int, token []byte, err error) {
+		if atEOF && len(data) == 0 {
+			return 0, nil, nil
+		}
+		if i := bytes.IndexByte(data, '\n'); i >= 0 {
+			return i + 1, data[0:i], nil
+		}
+		if atEOF {
+			return len(data), data, nil
+		}
+		return 0, nil, nil
+	})
+	dataChan := make(chan string)
+	stopChan := make(chan bool)
+	go func() {
+		for scanner.Scan() {
+			data := scanner.Text()
+			if len(data) < len("data: ") {
+				continue
+			}
+			data = strings.TrimPrefix(data, "data: ")
+			dataChan <- data
+		}
+		stopChan <- true
+	}()
+	SetEventStreamHeaders(c)
+	id := GetResponseID(c)
+	//responseModel := c.GetString("original_model")
+	c.Stream(func(w io.Writer) bool {
+		select {
+		case data := <-dataChan:
+			// some implementations may add \r at the end of data
+			data = strings.TrimSuffix(data, "\r")
+			var codeResponse ChatCompletionsStreamResponse
+			err := json.Unmarshal([]byte(data), &codeResponse)
+			if err != nil {
+				if data == "[DONE]" {
+					return true
+				}
+				log.Println("error unmarshalling stream response: ", err.Error())
+				return true
+			}
+			if strings.HasPrefix(s.cfg.CodeInstructModel, "@") {
+				//for _, choiceData := range codeResponse.Choices {
+				//	choiceData.Index = 1
+				//}
+				if codeResponse.Choices[0].Delta.Content == "<｜end▁of▁sentence｜>" {
+					codeResponse.Choices[0].Delta.Content = ""
+				}
+				jsonStr, err := json.Marshal(codeResponse)
+				if err != nil {
+					log.Println("error marshalling stream response: ", err.Error())
+					return true
+				}
+				c.Render(-1, CustomEvent{Data: "data: " + string(jsonStr)})
+			} else {
+				c.Render(-1, CustomEvent{Data: "data:" + string(data)})
+			}
+			return true
+		case <-stopChan:
+			endStr := `stop`
+			endChoises := ChatCompletionsStreamResponseChoice{
+				FinishReason: &endStr,
+			}
+			endResponse := ChatCompletionsStreamResponse{
+				Id:      id,
+				Object:  "chat.completion.chunk",
+				Created: GetTimestamp(),
+				Model:   s.cfg.CodeInstructModel,
+				Choices: []ChatCompletionsStreamResponseChoice{},
+			}
+			endResponse.Choices = append(endResponse.Choices, endChoises)
+			jsonStr, err := json.Marshal(endResponse)
+			if err != nil {
+				log.Println("error marshalling stream response: ", err.Error())
+				return true
+			}
+			c.Render(-1, CustomEvent{Data: "data: " + string(jsonStr)})
+			c.Render(-1, CustomEvent{Data: "data: [DONE]"})
+			return false
+		}
+	})
+	_ = resp.Body.Close()
 }
 
 func ConstructRequestBody(body []byte, cfg *config) []byte {
@@ -340,13 +527,28 @@ func ConstructRequestBody(body []byte, cfg *config) []byte {
 	if strings.Contains(cfg.CodeInstructModel, StableCodeModelPrefix) {
 		return constructWithStableCodeModel(body)
 	} else if strings.HasPrefix(cfg.CodeInstructModel, "@") {
-		return constructWithStableCodeModel(body)
+		return constructWithCfCodeModel(body)
 	}
 	if strings.HasSuffix(cfg.ChatApiBase, "chat") {
 		// @Todo  constructWithChatModel
 		// 如果code base以chat结尾则构建chatModel，暂时没有好的prompt
 	}
 	return body
+}
+
+func constructWithCfCodeModel(body []byte) []byte {
+	suffix := gjson.GetBytes(body, "suffix")
+	prompt := gjson.GetBytes(body, "prompt")
+	content := fmt.Sprintf("<｜fim▁begin｜>%s<｜fim▁hole｜>%s<｜fim▁end｜>", prompt, suffix)
+
+	// 创建新的 JSON 对象并添加到 body 中
+	messages := []map[string]string{
+		{
+			"role":    "user",
+			"content": content,
+		},
+	}
+	return constructWithChatModel(body, messages)
 }
 
 func constructWithStableCodeModel(body []byte) []byte {
