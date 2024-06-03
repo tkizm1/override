@@ -46,13 +46,6 @@ type config struct {
 	AuthToken            string            `json:"auth_token"`
 }
 
-type GPTMessage struct {
-	Role    string `json:"role"`
-	Content string `json:"content"`
-}
-type StreamResponse struct {
-	Response string `json:"response"`
-}
 type Message struct {
 	Role    string  `json:"role,omitempty"`
 	Content any     `json:"content,omitempty"`
